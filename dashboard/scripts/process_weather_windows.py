@@ -4,194 +4,164 @@ import os
 import xarray as xr
 import pandas as pd
 import numpy as np
+import streamlit as st
 from glob import glob
 from .utils import extract_time_series_at_location, rolling_weather_window_checker
-#from dashboard.scripts.utils import extract_time_series_at_location, rolling_weather_window_checker
 
 
+# -----------------------------------------------------------------------------
+# Cached I/O layer
+# -----------------------------------------------------------------------------
+# The expensive part of every compute call is opening 10 NetCDF files and
+# extracting time series at a location. We cache that extraction once per
+# (lat, lon, data_dir) tuple, so every subsequent analysis at the same point
+# (any threshold, any duration) is essentially free.
 
-def compute_monthly_weather_windows(lat, lon, wave_threshold, wind_threshold, duration_hours, data_dir="data/processed/"):
+@st.cache_data(show_spinner=False)
+def _load_location_series(lat, lon, data_dir="data/processed/"):
     """
-    Compute average monthly weather window counts across 10 years.
-
-    Parameters:
-    - lat, lon: Location
-    - wave_threshold: max significant wave height (m)
-    - wind_threshold: max wind speed (m/s), or None if not used
-    - duration_hours: window duration in hours
-    - data_dir: path to NetCDF files with valid_time
-
-    Returns:
-    - pandas DataFrame with columns ['month', 'avg_weather_window_count']
+    Load all 10 years of (time, swh, u10, v10) at a single (lat, lon).
+    Result is cached by (lat, lon, data_dir).
     """
     netcdf_files = sorted(glob(os.path.join(data_dir, "*_with_valid_time.nc")))
-    monthly_results = []
+
+    times = []
+    swh_list = []
+    u10_list = []
+    v10_list = []
 
     for file in netcdf_files:
         ds = xr.open_dataset(file)
-        time = ds['valid_time']
-        
-        # Get time series for location
-        swh = extract_time_series_at_location(ds['swh'], lat, lon)
-        
-        if wind_threshold is not None:
-            u10 = extract_time_series_at_location(ds['u10'], lat, lon)
-            v10 = extract_time_series_at_location(ds['v10'], lat, lon)
-            wind = np.sqrt(u10**2 + v10**2)
+        times.append(ds['valid_time'].values)
+        swh_list.append(extract_time_series_at_location(ds['swh'], lat, lon).values)
+        u10_list.append(extract_time_series_at_location(ds['u10'], lat, lon).values)
+        v10_list.append(extract_time_series_at_location(ds['v10'], lat, lon).values)
+        ds.close()
 
-            mask = (swh <= wave_threshold) & (wind <= wind_threshold)
-        else:
-            mask = swh <= wave_threshold
-
-        # Rolling window logic
-        # NEW
-        rolled = rolling_weather_window_checker(mask, duration_hours)
-        valid_windows = rolled >= duration_hours  # Now this is boolean
-
-
-        df = pd.DataFrame({
-            'time': time.values,
-            'valid_window': valid_windows.values
-        })
-        df['month'] = pd.to_datetime(df['time']).dt.month
-        monthly_counts = df[df['valid_window']].groupby('month').size()
-        
-
-        total_hours_per_month = df.groupby('month').size()  # Total hours per month in data
-        monthly_df = pd.DataFrame({
-            'month': monthly_counts.index,
-            'window_count': monthly_counts.values,
-            'total_hours': total_hours_per_month.reindex(monthly_counts.index).values
-        })
-        monthly_results.append(monthly_df)
+    df = pd.DataFrame({
+        'time': np.concatenate(times),
+        'swh': np.concatenate(swh_list),
+        'u10': np.concatenate(u10_list),
+        'v10': np.concatenate(v10_list),
+    })
+    df['time'] = pd.to_datetime(df['time'])
+    df['wind'] = np.sqrt(df['u10']**2 + df['v10']**2)
+    df['year'] = df['time'].dt.year
+    df['month'] = df['time'].dt.month
+    return df
 
 
-    # Combine across years and average
-        # Combine across years and compute mean values
-    combined_df = pd.concat(monthly_results)
-    grouped = combined_df.groupby('month').agg({
-        'window_count': 'mean',
-        'total_hours': 'mean'
-    }).reset_index()
+def _build_mask(df, wave_threshold, wind_threshold):
+    """Boolean Series indicating hours that satisfy the thresholds."""
+    mask = df['swh'] <= wave_threshold
+    if wind_threshold is not None:
+        mask = mask & (df['wind'] <= wind_threshold)
+    return mask
+
+
+def _rolling_valid(mask_series, duration_hours):
+    """
+    For each hour t, True if hours [t-duration+1, t] are all admissible.
+    Pure pandas implementation — fast and avoids xarray's rolling overhead.
+    """
+    return mask_series.rolling(window=duration_hours, min_periods=duration_hours).sum() >= duration_hours
+
+
+# -----------------------------------------------------------------------------
+# Public API (unchanged signatures so app.py needs no changes)
+# -----------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def compute_monthly_weather_windows(lat, lon, wave_threshold, wind_threshold, duration_hours, data_dir="data/processed/"):
+    """
+    Compute average monthly weather window counts across all years.
+    Returns DataFrame with ['month', 'avg_weather_window_count', 'percent_access'].
+    """
+    df = _load_location_series(lat, lon, data_dir).copy()
+    mask = _build_mask(df, wave_threshold, wind_threshold)
+    df['valid_window'] = _rolling_valid(mask, duration_hours)
+
+    # Per-year per-month counts, then average across years
+    yearly = df.groupby(['year', 'month']).agg(
+        window_count=('valid_window', 'sum'),
+        total_hours=('valid_window', 'size')
+    ).reset_index()
+
+    grouped = yearly.groupby('month').agg(
+        window_count=('window_count', 'mean'),
+        total_hours=('total_hours', 'mean')
+    ).reset_index()
+
     grouped['percent_access'] = (grouped['window_count'] / grouped['total_hours']) * 100
-    grouped.rename(columns={'window_count': 'avg_weather_window_count'}, inplace=True)
+    grouped = grouped.rename(columns={'window_count': 'avg_weather_window_count'})
     return grouped[['month', 'avg_weather_window_count', 'percent_access']]
 
 
-def compute_duration_distribution(lat, lon, wave_threshold, wind_threshold, data_dir="data/processed/"):
-    """
-    Compute frequency of weather window durations across all years.
-
-    Returns:
-    - DataFrame with duration (in hours) and count
-    """
-    netcdf_files = sorted(glob(os.path.join(data_dir, "*_with_valid_time.nc")))
-    duration_list = []
-
-    for file in netcdf_files:
-        ds = xr.open_dataset(file)
-        time = ds['valid_time']
-
-        swh = extract_time_series_at_location(ds['swh'], lat, lon)
-        
-        if wind_threshold is not None:
-            u10 = extract_time_series_at_location(ds['u10'], lat, lon)
-            v10 = extract_time_series_at_location(ds['v10'], lat, lon)
-            wind = np.sqrt(u10**2 + v10**2)
-            mask = (swh <= wave_threshold) & (wind <= wind_threshold)
-        else:
-            mask = swh <= wave_threshold
-
-        # Convert to 1D numpy array
-        mask_vals = mask.values.astype(int)
-        
-        current_length = 0
-        for is_valid in mask_vals:
-            if is_valid:
-                current_length += 1
-            else:
-                if current_length > 0:
-                    duration_list.append(current_length)
-                    current_length = 0
-        if current_length > 0:
-            duration_list.append(current_length)
-
-    # Count durations
-    duration_series = pd.Series(duration_list)
-    duration_counts = duration_series.value_counts().sort_index().reset_index()
-    duration_counts.columns = ['duration_hours', 'count']
-    
-    return duration_counts
-
+@st.cache_data(show_spinner=False)
 def compute_wait_times(lat, lon, wave_threshold, wind_threshold, duration_hours, data_dir="data/processed/"):
-    from glob import glob
-    import xarray as xr
-    import numpy as np
-    import pandas as pd
-    #from scripts.utils import extract_time_series_at_location, rolling_weather_window_checker
-    #from dashboard.scripts.utils import extract_time_series_at_location, rolling_weather_window_checker
+    """
+    Compute wait times between consecutive valid weather windows.
+    Returns DataFrame with ['wait_hours', 'month'].
+    """
+    df = _load_location_series(lat, lon, data_dir).copy()
+    mask = _build_mask(df, wave_threshold, wind_threshold)
+    df['valid'] = _rolling_valid(mask, duration_hours)
+
+    valid_df = df[df['valid']].reset_index(drop=True)
+    if len(valid_df) < 2:
+        return pd.DataFrame(columns=['wait_hours', 'month'])
+
+    deltas = valid_df['time'].diff().dt.total_seconds() / 3600
+    wait_mask = deltas > duration_hours
+    out = pd.DataFrame({
+        'wait_hours': deltas[wait_mask].values,
+        'month': valid_df.loc[wait_mask, 'time'].dt.month.values,
+    })
+    return out
 
 
-    netcdf_files = sorted(glob(os.path.join(data_dir, "*_with_valid_time.nc")))
-    wait_times = []
-
-    for file in netcdf_files:
-        ds = xr.open_dataset(file)
-        time = ds['valid_time']
-        swh = extract_time_series_at_location(ds['swh'], lat, lon)
-
-        if wind_threshold is not None:
-            u10 = extract_time_series_at_location(ds['u10'], lat, lon)
-            v10 = extract_time_series_at_location(ds['v10'], lat, lon)
-            wind = np.sqrt(u10 ** 2 + v10 ** 2)
-            mask = (swh <= wave_threshold) & (wind <= wind_threshold)
-        else:
-            mask = swh <= wave_threshold
-
-        rolled = rolling_weather_window_checker(mask, duration_hours)
-        valid = rolled >= duration_hours
-
-        df = pd.DataFrame({
-            'time': time.values,
-            'valid': valid.values
-        })
-
-        df['time'] = pd.to_datetime(df['time'])
-        df = df[df['valid']].reset_index(drop=True)
-
-        for i in range(1, len(df)):
-            delta = (df.loc[i, 'time'] - df.loc[i - 1, 'time']).total_seconds() / 3600  # in hours
-            if delta > duration_hours:
-                wait_times.append({
-                    'wait_hours': delta,
-                    'month': df.loc[i, 'time'].month
-                })
-
-    return pd.DataFrame(wait_times)  # Returns DataFrame with wait_hours and month
-
-
-def compute_persistence_table(lat, lon, wave_threshold, wind_threshold=None, durations=[3, 6, 12, 24, 48]):
-    all_durations = []
-
+@st.cache_data(show_spinner=False)
+def compute_persistence_table(lat, lon, wave_threshold, wind_threshold=None, durations=(3, 6, 12, 24, 48)):
+    """
+    Persistence table: rows = duration_hours, columns = month, values = % accessibility.
+    """
+    rows = []
     for duration in durations:
-        df = compute_monthly_weather_windows(lat, lon, wave_threshold, wind_threshold, duration)
-        df['duration_hours'] = duration
-        df = df.rename(columns={'percent_access': 'access_percent'})  # rename for clarity
-        all_durations.append(df[['month', 'access_percent', 'duration_hours']])
+        monthly = compute_monthly_weather_windows(lat, lon, wave_threshold, wind_threshold, duration)
+        monthly = monthly.rename(columns={'percent_access': 'access_percent'})
+        monthly['duration_hours'] = duration
+        rows.append(monthly[['month', 'access_percent', 'duration_hours']])
 
-    result_df = pd.concat(all_durations)
-
-    # Pivot: rows = duration, columns = month, values = percent access
-    pivot_df = result_df.pivot_table(index='duration_hours', columns='month', values='access_percent', fill_value=0)
-
-    # Sort months numerically
-    month_order = list(range(1, 13))
-    pivot_df = pivot_df.reindex(columns=month_order, fill_value=0)
-
+    result_df = pd.concat(rows)
+    pivot_df = result_df.pivot_table(
+        index='duration_hours', columns='month', values='access_percent', fill_value=0
+    )
+    pivot_df = pivot_df.reindex(columns=list(range(1, 13)), fill_value=0)
     return pivot_df
 
 
+@st.cache_data(show_spinner=False)
+def compute_duration_distribution(lat, lon, wave_threshold, wind_threshold=None, data_dir="data/processed/"):
+    """
+    Frequency of weather window durations across all years.
+    Returns DataFrame with ['duration_hours', 'count'].
+    """
+    df = _load_location_series(lat, lon, data_dir).copy()
+    mask = _build_mask(df, wave_threshold, wind_threshold).values.astype(int)
 
+    durations = []
+    current = 0
+    for v in mask:
+        if v:
+            current += 1
+        else:
+            if current > 0:
+                durations.append(current)
+                current = 0
+    if current > 0:
+        durations.append(current)
 
-
-
+    series = pd.Series(durations)
+    counts = series.value_counts().sort_index().reset_index()
+    counts.columns = ['duration_hours', 'count']
+    return counts
