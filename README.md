@@ -8,7 +8,7 @@ This dashboard accompanies the paper:
 
 ## Live demo
 
-A live version of the dashboard is hosted at: *(link to be added after deployment)*
+A live version of the dashboard is hosted at: https://weather-windows-ireland.streamlit.app/
 
 ## What it does
 
